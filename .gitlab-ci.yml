@@ -1,0 +1,231 @@
+# =====================================================================
+# DATA-38470 · Миграция aapmToken → aapmSecret во ВСЕХ config-репах
+# middleconf/itbigdata/**
+# ---------------------------------------------------------------------
+# Что делает: рекурсивно перебирает ВСЕ проекты (репозитории) под
+# группой middleconf/itbigdata (include_subgroups=true), в каждом ищет
+# в *-values.yaml строки вида
+#     aapmToken: "<UUID>"
+# и, ЕСЛИ <UUID> — один из трёх известных PAM-токенов, заменяет строку на
+#     aapmSecret: "<pam_token_*>"   # значение AAPM-токена для обращения за секретом.
+# В репах, где есть изменения, создаёт ветку feature/DATA-38470.update_token_pam
+# и выставляет MR в master. Разработчики принимают MR сами.
+#
+# Маппинг (по значению, которое СЕЙЧАС стоит в aapmToken):
+#   UUID берутся из CI-переменных GitLab с теми же именами, что и целевой
+#   aapmSecret: pam_token_lambda_llm / pam_token_prod_llm / pam_token_sandbox_llm
+#   (имя переменной = имя aapmSecret, её значение = UUID). В коде/истории UUID нет.
+# UUID, которого нет среди значений этих переменных, НЕ трогаем.
+# Строки, где уже стоит aapmSecret, не трогаем (идемпотентно).
+#
+# Запуск: Run pipeline (ручной). По умолчанию dry_run=true — только показать
+# дифф без push/MR. Для реальной раскатки выставить dry_run=false.
+# =====================================================================
+
+spec:
+  inputs:
+    middleconf_group_path:
+      type: string
+      default: "middleconf/itbigdata"
+      description: "🎯 Корневая группа, под которой рекурсивно перебираются все config-репы"
+    feature_branch:
+      type: string
+      default: "feature/DATA-38470.update_token_pam"
+      description: "Ветка, которую создаём в каждом репо под MR"
+    target_branch:
+      type: string
+      default: "master"
+      description: "Ветка-приёмник MR"
+    dry_run:
+      type: boolean
+      default: true
+      description: "true — только показать дифф (без push и MR); false — пушить ветки и выставлять MR"
+---
+
+include:
+  - project: 'middle/itbigdata/devops_tools/gitlab-templates'
+    file: 'templates/unixrepo-auth.yml'
+
+default:
+  tags:
+    - docker-abd
+
+# Только ручной запуск через форму Run pipeline.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+stages:
+  - migrate
+
+variables:
+  GITLAB_URL: "https://cicd-git.megafon.ru"
+  CI_IMAGE: "mf-ubi-target-docker-local.unixrepo.megafon.ru/alpine:3.22"
+  MIDDLECONF_GROUP_PATH: "$[[ inputs.middleconf_group_path ]]"
+  FEATURE_BRANCH: "$[[ inputs.feature_branch ]]"
+  TARGET_BRANCH: "$[[ inputs.target_branch ]]"
+  DRY_RUN: "$[[ inputs.dry_run ]]"
+
+update-aapm-token:
+  stage: migrate
+  image: $CI_IMAGE
+  before_script:
+    - !reference [.unixrepo_configuration, auth_apk]
+    - apk add --no-cache git curl jq python3
+    - git config --global user.email "it-reporting-deployment-devops@megafon.ru"
+    - git config --global user.name "CICD Generator"
+  script:
+    # --- Питон-замена: единственное место, где живёт маппинг и правило правки ---
+    - |
+      cat > /tmp/replace_aapm.py <<'PYEOF'
+      import os, re, sys
+
+      root = sys.argv[1]
+
+      # Маппинг строго по значению, которое СЕЙЧАС стоит в aapmToken.
+      # UUID НЕ хардкодим: берём из CI-переменных GitLab, имена которых совпадают
+      # с целевым aapmSecret (значение переменной = UUID). MAP: uuid -> имя.
+      # Нет UUID среди значений -> строку не трогаем (нечем заменить — нет имени).
+      NAMES = ["pam_token_lambda_llm", "pam_token_prod_llm", "pam_token_sandbox_llm"]
+      MAP = {}
+      for _n in NAMES:
+          _uuid = (os.environ.get(_n) or "").strip().lower()
+          if _uuid:
+              MAP[_uuid] = _n
+      if not MAP:
+          sys.stderr.write(
+              "ERROR: не заданы CI-переменные с UUID токенов: %s\n" % ", ".join(NAMES)
+          )
+          sys.exit(2)
+      COMMENT = "# значение AAPM-токена для обращения за секретом."
+
+      # aapmToken: "<uuid>"  (с любым отступом, опциональным хвостовым комментарием)
+      line_re = re.compile(r'^(\s*)aapmToken:\s*"([0-9A-Fa-f-]+)"\s*(?:#.*)?$')
+
+      changed = []
+      for dirpath, dirs, files in os.walk(root):
+          if ".git" in dirs:
+              dirs.remove(".git")
+          for fn in files:
+              # строго values-файлы стендов: <stand>-values.yaml
+              if not fn.endswith("-values.yaml"):
+                  continue
+              p = os.path.join(dirpath, fn)
+              with open(p, "r", encoding="utf-8") as f:
+                  lines = f.readlines()
+              out, touched = [], False
+              for ln in lines:
+                  m = line_re.match(ln.rstrip("\n"))
+                  if m:
+                      uuid = m.group(2).lower()
+                      if uuid in MAP:
+                          indent = m.group(1)
+                          value = '"%s"' % MAP[uuid]
+                          out.append("%saapmSecret: %-23s %s\n" % (indent, value, COMMENT))
+                          touched = True
+                          continue
+                  out.append(ln)
+              if touched:
+                  with open(p, "w", encoding="utf-8") as f:
+                      f.writelines(out)
+                  changed.append(os.path.relpath(p, root))
+
+      for c in changed:
+          print(c)
+      PYEOF
+    # --- Перебор всех репозиториев группы и правка ---
+    - |
+      TOKEN="${GITLAB_MIDDLECONF_TUZ_TOKEN}"
+      [ -z "$TOKEN" ] && { echo "ERROR: пуст GITLAB_MIDDLECONF_TUZ_TOKEN"; exit 1; }
+      API="${GITLAB_URL}/api/v4"
+      GREEN=$(printf '\033[32m'); YELLOW=$(printf '\033[33m'); RED=$(printf '\033[31m'); BOLD=$(printf '\033[1m'); RESET=$(printf '\033[0m')
+
+      GROUP_ENC=$(echo "${MIDDLECONF_GROUP_PATH}" | sed 's|/|%2F|g')
+      GROUP_ID=$(curl -s --header "PRIVATE-TOKEN: ${TOKEN}" "${API}/groups/${GROUP_ENC}" | jq -r '.id // empty')
+      [ -z "$GROUP_ID" ] && { echo "ERROR: группа ${MIDDLECONF_GROUP_PATH} не найдена (нет прав у ТУЗа?)"; exit 1; }
+      echo "Группа ${MIDDLECONF_GROUP_PATH} → ID=${GROUP_ID}"
+
+      # Рекурсивно собираем все проекты группы (с пагинацией)
+      PROJECTS="[]"; page=1
+      while : ; do
+        RESP=$(curl -s --header "PRIVATE-TOKEN: ${TOKEN}" \
+          "${API}/groups/${GROUP_ID}/projects?include_subgroups=true&archived=false&per_page=100&page=${page}")
+        CNT=$(echo "$RESP" | jq 'length')
+        [ "$CNT" = "0" ] && break
+        PROJECTS=$(jq -s 'add' <(echo "$PROJECTS") <(echo "$RESP"))
+        page=$((page+1))
+      done
+      TOTAL=$(echo "$PROJECTS" | jq 'length')
+      echo "Найдено репозиториев: ${TOTAL}"
+
+      # Счётчики (через файлы — while читает в сабшелле)
+      : > /tmp/mr.txt ; : > /tmp/skip.txt ; : > /tmp/fail.txt
+
+      echo "$PROJECTS" | jq -c '.[]' | while read -r proj; do
+        PNS=$(echo "$proj" | jq -r '.path_with_namespace')
+        echo ""
+        echo "${BOLD}=== ${PNS} ===${RESET}"
+
+        WORK="/tmp/repo"; rm -rf "$WORK"
+        if ! git clone -q --branch "${TARGET_BRANCH}" \
+              "https://oauth2:${TOKEN}@cicd-git.megafon.ru/${PNS}.git" "$WORK" 2>/tmp/clone.err; then
+          echo "${YELLOW}  пропуск: не удалось клонировать ветку ${TARGET_BRANCH} ($(cat /tmp/clone.err | tail -n1))${RESET}"
+          echo "$PNS" >> /tmp/skip.txt
+          continue
+        fi
+        cd "$WORK"
+
+        # Используем существующую feature-ветку (если осталась с прошлого прогона), иначе режем от target
+        git checkout -q "${FEATURE_BRANCH}" 2>/dev/null || git checkout -q -b "${FEATURE_BRANCH}"
+
+        CHANGED=$(python3 /tmp/replace_aapm.py "$WORK")
+        if [ -z "$CHANGED" ]; then
+          echo "  нет подходящих aapmToken — пропуск"
+          echo "$PNS" >> /tmp/skip.txt
+          cd /; continue
+        fi
+        echo "${GREEN}  изменены файлы:${RESET}"; echo "$CHANGED" | sed 's/^/    /'
+
+        git add -A
+        if git diff --cached --quiet; then
+          echo "  уже мигрировано ранее — изменений нет"
+          echo "$PNS" >> /tmp/skip.txt
+          cd /; continue
+        fi
+
+        echo "${BOLD}  --- diff ---${RESET}"
+        git --no-pager diff --cached --no-color | sed 's/^/    /'
+
+        if [ "$DRY_RUN" = "true" ]; then
+          echo "${YELLOW}  DRY_RUN=true — push и MR не выполняются${RESET}"
+          echo "$PNS" >> /tmp/mr.txt
+          cd /; continue
+        fi
+
+        git commit -q -m "chore(DATA-38470): aapmToken → aapmSecret (PAM)"
+        if git push -f \
+            -o merge_request.create \
+            -o merge_request.target="${TARGET_BRANCH}" \
+            -o merge_request.title="DATA-38470: обновление AAPM-токена PAM (aapmToken → aapmSecret)" \
+            -o merge_request.description="Автоматическая миграция по задаче DATA-38470: ключ aapmToken заменён на aapmSecret с именем PAM-токена. Просьба проверить и принять MR." \
+            origin "${FEATURE_BRANCH}" 2>/tmp/push.err; then
+          echo "${GREEN}  MR создан/обновлён${RESET}"
+          echo "$PNS" >> /tmp/mr.txt
+        else
+          echo "${RED}  ОШИБКА push/MR: $(tail -n1 /tmp/push.err)${RESET}"
+          echo "$PNS" >> /tmp/fail.txt
+        fi
+        cd /
+      done
+
+      echo ""
+      echo "${BOLD}========================================${RESET}"
+      echo "${BOLD}  ИТОГО (DRY_RUN=${DRY_RUN})${RESET}"
+      echo "  репозиториев просмотрено : ${TOTAL}"
+      echo "  с изменениями / MR       : $(wc -l < /tmp/mr.txt | tr -d ' ')"
+      echo "  без изменений / пропуск  : $(wc -l < /tmp/skip.txt | tr -d ' ')"
+      echo "  ошибок                   : $(wc -l < /tmp/fail.txt | tr -d ' ')"
+      echo "${BOLD}========================================${RESET}"
+      [ -s /tmp/mr.txt ]   && { echo "Затронуты:"; sed 's/^/  - /' /tmp/mr.txt; }
+      [ -s /tmp/fail.txt ] && { echo "${RED}Ошибки:${RESET}"; sed 's/^/  - /' /tmp/fail.txt; exit 1; }
+      exit 0
