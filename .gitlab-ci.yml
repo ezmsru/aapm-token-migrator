@@ -226,6 +226,7 @@ update-aapm-token:
       echo "  без изменений / пропуск  : $(wc -l < /tmp/skip.txt | tr -d ' ')"
       echo "  ошибок                   : $(wc -l < /tmp/fail.txt | tr -d ' ')"
       echo "${BOLD}========================================${RESET}"
-      [ -s /tmp/mr.txt ]   && { echo "Затронуты:"; sed 's/^/  - /' /tmp/mr.txt; }
-      [ -s /tmp/fail.txt ] && { echo "${RED}Ошибки:${RESET}"; sed 's/^/  - /' /tmp/fail.txt; exit 1; }
+      [ -s /tmp/mr.txt ]   && { echo ""; echo "${GREEN}Затронуты (есть изменения / MR):${RESET}"; sed 's/^/  - /' /tmp/mr.txt; }
+      [ -s /tmp/skip.txt ] && { echo ""; echo "${YELLOW}Не затронуты (нет подходящего aapmToken / уже мигрировано / пропуск):${RESET}"; sed 's/^/  - /' /tmp/skip.txt; }
+      [ -s /tmp/fail.txt ] && { echo ""; echo "${RED}Ошибки:${RESET}"; sed 's/^/  - /' /tmp/fail.txt; exit 1; }
       exit 0
