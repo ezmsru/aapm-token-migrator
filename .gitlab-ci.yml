@@ -44,6 +44,10 @@ spec:
       type: boolean
       default: false
       description: "true — НЕ мигрировать, а удалить ранее созданные MR: закрыть открытые MR из feature-ветки и удалить саму ветку во всех репах. Уважает dry_run (true — только показать, что было бы удалено)"
+    merge_mrs:
+      type: boolean
+      default: false
+      description: "true — НЕ мигрировать, а рекурсивно слить (merge) все открытые MR из feature-ветки во всех репах группы (удаляя ветку-источник). Уважает dry_run (true — только показать, что было бы слито)"
 ---
 
 include:
@@ -70,6 +74,7 @@ variables:
   TARGET_BRANCH: "$[[ inputs.target_branch ]]"
   DRY_RUN: "$[[ inputs.dry_run ]]"
   CLEANUP_MRS: "$[[ inputs.cleanup_mrs ]]"
+  MERGE_MRS: "$[[ inputs.merge_mrs ]]"
 
 update-aapm-token:
   stage: migrate
@@ -227,6 +232,52 @@ update-aapm-token:
         echo "  закрыто MR               : $(wc -l < /tmp/cl_mr.txt | tr -d ' ')"
         echo "  удалено веток            : $(wc -l < /tmp/cl_br.txt | tr -d ' ')"
         echo "${BOLD}========================================${RESET}"
+        exit 0
+      fi
+
+      # ===================================================================
+      # Режим слияния: НЕ мигрируем, а рекурсивно сливаем (merge) все
+      # открытые MR из feature-ветки во всех репах группы.
+      # ===================================================================
+      if [ "$MERGE_MRS" = "true" ]; then
+        : > /tmp/mg_ok.txt ; : > /tmp/mg_fail.txt
+        echo "$PROJECTS" | jq -c '.[]' | while read -r proj; do
+          PID=$(echo "$proj" | jq -r '.id')
+          PNS=$(echo "$proj" | jq -r '.path_with_namespace')
+
+          MRS=$(curl -s --header "PRIVATE-TOKEN: ${TOKEN}" \
+            "${API}/projects/${PID}/merge_requests?state=opened&source_branch=${FB_ENC}&per_page=100")
+          echo "$MRS" | jq -c '.[]?' | while read -r mr; do
+            IID=$(echo "$mr" | jq -r '.iid')
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "${YELLOW}  [dry] слил бы MR !${IID} (${PNS})${RESET}"
+              echo "${PNS}!${IID}" >> /tmp/mg_ok.txt
+              continue
+            fi
+            # PUT .../merge — should_remove_source_branch удаляет ветку после слияния
+            RESP=$(curl -s --write-out '\n%{http_code}' --request PUT \
+              --header "PRIVATE-TOKEN: ${TOKEN}" \
+              "${API}/projects/${PID}/merge_requests/${IID}/merge?should_remove_source_branch=true")
+            CODE=$(echo "$RESP" | tail -n1)
+            if [ "$CODE" = "200" ]; then
+              echo "${GREEN}  слит MR !${IID} (${PNS})${RESET}"
+              echo "${PNS}!${IID}" >> /tmp/mg_ok.txt
+            else
+              MSG=$(echo "$RESP" | sed '$d' | jq -r '.message // .error // "HTTP '"$CODE"'"' 2>/dev/null)
+              echo "${RED}  не удалось слить MR !${IID} (${PNS}): ${MSG}${RESET}"
+              echo "${PNS}!${IID}" >> /tmp/mg_fail.txt
+            fi
+          done
+        done
+
+        echo ""
+        echo "${BOLD}========================================${RESET}"
+        echo "${BOLD}  СЛИЯНИЕ (DRY_RUN=${DRY_RUN})${RESET}"
+        echo "  репозиториев просмотрено : ${TOTAL}"
+        echo "  слито MR                 : $(wc -l < /tmp/mg_ok.txt | tr -d ' ')"
+        echo "  ошибок слияния           : $(wc -l < /tmp/mg_fail.txt | tr -d ' ')"
+        echo "${BOLD}========================================${RESET}"
+        [ -s /tmp/mg_fail.txt ] && { echo ""; echo "${RED}Не слиты (конфликты / нет прав / не одобрено / пайплайн):${RESET}"; sed 's/^/  - /' /tmp/mg_fail.txt; exit 1; }
         exit 0
       fi
 
