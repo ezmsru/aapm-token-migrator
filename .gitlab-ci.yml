@@ -40,6 +40,10 @@ spec:
       type: boolean
       default: true
       description: "true — только показать дифф (без push и MR); false — пушить ветки и выставлять MR"
+    cleanup_mrs:
+      type: boolean
+      default: false
+      description: "true — НЕ мигрировать, а удалить ранее созданные MR: закрыть открытые MR из feature-ветки и удалить саму ветку во всех репах. Уважает dry_run (true — только показать, что было бы удалено)"
 ---
 
 include:
@@ -65,6 +69,7 @@ variables:
   FEATURE_BRANCH: "$[[ inputs.feature_branch ]]"
   TARGET_BRANCH: "$[[ inputs.target_branch ]]"
   DRY_RUN: "$[[ inputs.dry_run ]]"
+  CLEANUP_MRS: "$[[ inputs.cleanup_mrs ]]"
 
 update-aapm-token:
   stage: migrate
@@ -111,22 +116,35 @@ update-aapm-token:
               if not fn.endswith("-values.yaml"):
                   continue
               p = os.path.join(dirpath, fn)
-              with open(p, "r", encoding="utf-8") as f:
+              # newline="" — отключаем трансляцию переводов строк: CRLF/CR/LF
+              # читаются и пишутся как есть. Иначе текстовый режим переписал бы
+              # весь файл (CRLF -> LF) и git показал бы дифф на все строки.
+              with open(p, "r", encoding="utf-8", newline="") as f:
                   lines = f.readlines()
               out, touched = [], False
               for ln in lines:
-                  m = line_re.match(ln.rstrip("\n"))
+                  # Отделяем тело строки от её оригинального окончания, чтобы
+                  # в заменённой строке сохранить ровно тот же EOL.
+                  if ln.endswith("\r\n"):
+                      body, eol = ln[:-2], "\r\n"
+                  elif ln.endswith("\n"):
+                      body, eol = ln[:-1], "\n"
+                  elif ln.endswith("\r"):
+                      body, eol = ln[:-1], "\r"
+                  else:
+                      body, eol = ln, ""
+                  m = line_re.match(body)
                   if m:
                       uuid = m.group(2).lower()
                       if uuid in MAP:
                           indent = m.group(1)
                           value = '"%s"' % MAP[uuid]
-                          out.append("%saapmSecret: %-23s %s\n" % (indent, value, COMMENT))
+                          out.append("%saapmSecret: %-23s %s%s" % (indent, value, COMMENT, eol))
                           touched = True
                           continue
                   out.append(ln)
               if touched:
-                  with open(p, "w", encoding="utf-8") as f:
+                  with open(p, "w", encoding="utf-8", newline="") as f:
                       f.writelines(out)
                   changed.append(os.path.relpath(p, root))
 
@@ -157,6 +175,60 @@ update-aapm-token:
       done
       TOTAL=$(echo "$PROJECTS" | jq 'length')
       echo "Найдено репозиториев: ${TOTAL}"
+
+      # URL-кодированное имя feature-ветки (для query- и path-параметров API)
+      FB_ENC=$(echo "${FEATURE_BRANCH}" | sed 's|/|%2F|g; s|\.|%2E|g')
+
+      # ===================================================================
+      # Режим очистки: НЕ мигрируем, а удаляем следы прошлых прогонов —
+      # закрываем открытые MR из feature-ветки и удаляем саму ветку.
+      # ===================================================================
+      if [ "$CLEANUP_MRS" = "true" ]; then
+        : > /tmp/cl_mr.txt ; : > /tmp/cl_br.txt
+        echo "$PROJECTS" | jq -c '.[]' | while read -r proj; do
+          PID=$(echo "$proj" | jq -r '.id')
+          PNS=$(echo "$proj" | jq -r '.path_with_namespace')
+
+          # Открытые MR, исходящие из нашей feature-ветки
+          MRS=$(curl -s --header "PRIVATE-TOKEN: ${TOKEN}" \
+            "${API}/projects/${PID}/merge_requests?state=opened&source_branch=${FB_ENC}&per_page=100")
+          echo "$MRS" | jq -c '.[]?' | while read -r mr; do
+            IID=$(echo "$mr" | jq -r '.iid')
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "${YELLOW}  [dry] закрыл бы MR !${IID} (${PNS})${RESET}"
+            else
+              curl -s --request PUT --header "PRIVATE-TOKEN: ${TOKEN}" \
+                "${API}/projects/${PID}/merge_requests/${IID}?state_event=close" >/dev/null \
+                && echo "${GREEN}  закрыт MR !${IID} (${PNS})${RESET}" \
+                || echo "${RED}  не удалось закрыть MR !${IID} (${PNS})${RESET}"
+            fi
+            echo "${PNS}!${IID}" >> /tmp/cl_mr.txt
+          done
+
+          # Удаляем саму feature-ветку, если она существует
+          if curl -sf --header "PRIVATE-TOKEN: ${TOKEN}" \
+               "${API}/projects/${PID}/repository/branches/${FB_ENC}" >/dev/null 2>&1; then
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "${YELLOW}  [dry] удалил бы ветку ${FEATURE_BRANCH} (${PNS})${RESET}"
+            else
+              curl -s --request DELETE --header "PRIVATE-TOKEN: ${TOKEN}" \
+                "${API}/projects/${PID}/repository/branches/${FB_ENC}" >/dev/null \
+                && echo "${GREEN}  удалена ветка ${FEATURE_BRANCH} (${PNS})${RESET}" \
+                || echo "${RED}  не удалось удалить ветку (${PNS})${RESET}"
+            fi
+            echo "${PNS}" >> /tmp/cl_br.txt
+          fi
+        done
+
+        echo ""
+        echo "${BOLD}========================================${RESET}"
+        echo "${BOLD}  ОЧИСТКА (DRY_RUN=${DRY_RUN})${RESET}"
+        echo "  репозиториев просмотрено : ${TOTAL}"
+        echo "  закрыто MR               : $(wc -l < /tmp/cl_mr.txt | tr -d ' ')"
+        echo "  удалено веток            : $(wc -l < /tmp/cl_br.txt | tr -d ' ')"
+        echo "${BOLD}========================================${RESET}"
+        exit 0
+      fi
 
       # Счётчики (через файлы — while читает в сабшелле)
       : > /tmp/mr.txt ; : > /tmp/skip.txt ; : > /tmp/fail.txt
